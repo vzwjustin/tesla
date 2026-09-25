@@ -193,6 +193,37 @@ async function getChargingHistory(vin: string): Promise<unknown> {
   return chargingCache.data;
 }
 
+// Driving-only energy for cars without a drive counter (Fleet Telemetry's LifetimeEnergyUsedDrive is Semi-only).
+// A drive is a run where Gear is D or R (VehicleSpeed > 0 when Gear is never reported); a charging record also
+// ends it, so energy added mid-trip can never cancel energy used. Each drive's energy is EnergyRemaining at its
+// start (last value reported at or before it: the car reports changes only, so that is the value in force) minus
+// the last value reported before the record that ended it, which may itself already carry charging energy. Measured across whole drives, this avoids the
+// undercount of per-sample deltas, and a charge that starts after parking never enters a drive.
+export function driveConsumption(points: TelemetryPoint[]): { kwh: number; miles: number; regenKwh?: number; drives: number } | undefined {
+  const series = (key: string) => points.flatMap(p => { const v = num(p, key); return v === undefined ? [] : [[p.timestamp.valueOf(), v] as const]; });
+  const energy = series("EnergyRemaining"), odometer = series("Odometer"), regen = series("LifetimeEnergyGainedRegen");
+  // Last value at or before t (inclusive) or strictly before it.
+  const at = (xs: ReadonlyArray<readonly [number, number]>, t: number, inclusive = true) => { let lo = 0, hi = xs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (inclusive ? xs[mid]![0] <= t : xs[mid]![0] < t) lo = mid + 1; else hi = mid; } return lo ? xs[lo - 1]![1] : undefined; };
+  const hasGear = points.some(p => typeof p.signals.Gear === "string");
+  const moving = (p: TelemetryPoint) => hasGear ? (typeof p.signals.Gear === "string" ? /^(ShiftState)?[DR]$/.test(p.signals.Gear) : undefined) : (num(p, "VehicleSpeed") === undefined ? undefined : num(p, "VehicleSpeed")! > 0);
+  const drives: Array<[number, number]> = [];
+  let start: number | undefined;
+  for (const p of points) {
+    const t = p.timestamp.valueOf(), m = p.signals.ChargeState === "Charging" || p.signals.ChargeState === "Starting" ? false : moving(p);
+    if (m === true && start === undefined) start = t;
+    else if (m === false && start !== undefined) { drives.push([start, t]); start = undefined; }
+  }
+  let kwh = 0, miles = 0, regenKwh = 0, counted = 0;
+  for (const [t0, t1] of drives) {
+    const e0 = at(energy, t0), e1 = at(energy, t1, false), o0 = at(odometer, t0), o1 = at(odometer, t1, false);
+    if (e0 === undefined || e1 === undefined || o0 === undefined || o1 === undefined || o1 - o0 < 0.3 || e0 - e1 < 0) continue;
+    kwh += e0 - e1; miles += o1 - o0; counted++;
+    const r0 = at(regen, t0), r1 = at(regen, t1, false);
+    if (r0 !== undefined && r1 !== undefined) regenKwh += r1 - r0;
+  }
+  return miles >= 1 ? { kwh: round(kwh, 3), miles: round(miles, 2), drives: counted, ...(regen.length ? { regenKwh: round(regenKwh, 3) } : {}) } : undefined;
+}
+
 // Derived, clearly-labelled estimates from the telemetry window. Each returns undefined when evidence is insufficient.
 export function computeAnalytics(points: TelemetryPoint[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -211,14 +242,22 @@ export function computeAnalytics(points: TelemetryPoint[]): Record<string, unkno
   const counters = Object.fromEntries(["LifetimeEnergyUsed", "LifetimeEnergyUsedDrive", "LifetimeEnergyGainedRegen", "LifetimeEnergyChargedKwh", "ACChargingEnergyIn", "DCChargingEnergyIn", "Odometer"].map(k => [k, delta(k)]).filter(([, v]) => v !== undefined));
   if (Object.keys(counters).length) out.windowDeltas = counters;
   const drive = counters.LifetimeEnergyUsedDrive as number | undefined, regen = counters.LifetimeEnergyGainedRegen as number | undefined;
+  const drives = drive ? undefined : driveConsumption(points);
   if (drive && regen !== undefined) out.regenRecoveredPct = round(regen / drive * 100, 1);
+  else if (drives?.regenKwh !== undefined && drives.kwh + drives.regenKwh > 0) out.regenRecoveredPct = round(drives.regenKwh / (drives.kwh + drives.regenKwh) * 100, 1);
 
-  // Consumption from lifetime counters: Δenergy ÷ Δodometer over the window. EnergyRemaining updates
-  // less often than Odometer, so per-interval EnergyRemaining deltas undercount. Drive-only counter
-  // preferred; LifetimeEnergyUsed also includes parked use (HVAC, Sentry, standby).
+  // Consumption: driving-only energy ÷ miles. Order of preference: the drive counter (Semi only), whole
+  // drives' ΔEnergyRemaining, then ΔLifetimeEnergyUsed, which also includes parked use (HVAC, Sentry, standby).
   const span = (key: string) => { const v = points.flatMap(p => { const x = num(p, key); return x === undefined ? [] : [x]; }); return v.length >= 2 ? v.at(-1)! - v[0]! : undefined; };
   const miles = span("Odometer"), driveKwh = span("LifetimeEnergyUsedDrive"), totalKwh = span("LifetimeEnergyUsed");
-  if (miles && miles >= 1 && (driveKwh || totalKwh)) out.consumption = {
+  if (!driveKwh && drives) out.consumption = {
+    whPerMile: round(drives.kwh / drives.miles * 1000, 0),
+    basis: `ΔEnergyRemaining over ${drives.drives} drive(s) ÷ ΔOdometer (driving only)`,
+    ...(totalKwh && miles && miles >= 1 ? { allInWhPerMile: round(totalKwh / miles * 1000, 0) } : {}),
+    kwhUsed: round(drives.kwh, 1),
+    miles: round(drives.miles, 1),
+  };
+  else if (miles && miles >= 1 && (driveKwh || totalKwh)) out.consumption = {
     whPerMile: round((driveKwh ?? totalKwh!) / miles * 1000, 0),
     basis: driveKwh ? "ΔLifetimeEnergyUsedDrive ÷ ΔOdometer (driving only)" : "ΔLifetimeEnergyUsed ÷ ΔOdometer (includes parked use)",
     ...(totalKwh ? { allInWhPerMile: round(totalKwh / miles * 1000, 0) } : {}),

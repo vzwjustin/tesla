@@ -1,6 +1,6 @@
 // Run: node test/analytics.test.mjs (after pnpm build)
 import assert from "node:assert/strict";
-import { computeAnalytics } from "../dist/dashboardData.js";
+import { computeAnalytics, driveConsumption } from "../dist/dashboardData.js";
 import { mergeLatest, readTelemetry } from "../dist/telemetry.js";
 
 const t0 = Date.parse("2026-01-01T00:00:00Z");
@@ -34,4 +34,27 @@ assert.deepEqual(filled.map(p => p.signals.Soc), [0, 30, 31, 60]);
 await writeFile(`${dir}/import2.jsonl`, JSON.stringify({ vin: "VIN0000000000001", created_at: new Date(t0 + 5 * 60_000).toISOString(), data: { Soc: 99, EnergyRemaining: 30, Source: "tessie" } }));
 const fieldFilled = await readTelemetry(undefined, undefined, `${dir}/fleet.jsonl,${dir}/import2.jsonl`);
 assert.deepEqual(fieldFilled[1].signals, { EnergyRemaining: 30, Source: "tessie" });
+// Driving-only consumption without LifetimeEnergyUsedDrive (Semi-only). Two drives: 3 kWh / 12 mi and 2 kWh / 8 mi
+// = 250 Wh/mi. Parked HVAC/Sentry use (+1 kWh on LifetimeEnergyUsed) and a charge right after parking stay out.
+const m = min => new Date(t0 + min * 60_000), pt = (min, signals) => ({ vin: "V", timestamp: m(min), signals });
+const trip = [
+  pt(0, { Gear: "ShiftStateP", EnergyRemaining: 50, Odometer: 1000, LifetimeEnergyUsed: 100, LifetimeEnergyGainedRegen: 10 }),
+  pt(10, { Gear: "ShiftStateD" }), pt(15, { EnergyRemaining: 48.5, Odometer: 1006 }), pt(20, { EnergyRemaining: 47, Odometer: 1012, LifetimeEnergyGainedRegen: 10.5 }),
+  pt(21, { Gear: "ShiftStateP", LifetimeEnergyUsed: 103 }),
+  pt(30, { ChargeState: "Charging", EnergyRemaining: 49 }), pt(90, { EnergyRemaining: 55, LifetimeEnergyUsed: 104 }),
+  pt(120, { Gear: "ShiftStateR" }), pt(121, { Gear: "ShiftStateD" }), pt(130, { EnergyRemaining: 53, Odometer: 1020, LifetimeEnergyGainedRegen: 11 }),
+  pt(131, { Gear: "ShiftStateP", LifetimeEnergyUsed: 106 }),
+];
+assert.deepEqual(driveConsumption(trip), { kwh: 5, miles: 20, drives: 2, regenKwh: 1 });
+const c = computeAnalytics(trip);
+assert.equal(c.consumption.whPerMile, 250); assert.match(c.consumption.basis, /over 2 drive\(s\).*driving only/);
+assert.equal(c.consumption.allInWhPerMile, 300, "all-in keeps parked use");
+assert.equal(c.regenRecoveredPct, 16.7, "regen ÷ (net drive + regen) = 1 ÷ 6");
+// Without Gear, VehicleSpeed defines the drive; plain Gear letters work too.
+assert.deepEqual(driveConsumption(trip.map(p => ({ ...p, signals: Object.fromEntries(Object.entries(p.signals).map(([k, v]) => k === "Gear" ? ["VehicleSpeed", /[DR]$/.test(v) ? 30 : 0] : [k, v])) }))).kwh, 5);
+assert.equal(driveConsumption(trip.map(p => ({ ...p, signals: { ...p.signals, ...(p.signals.Gear ? { Gear: p.signals.Gear.replace("ShiftState", "") } : {}) } }))).miles, 20);
+assert.equal(driveConsumption(trip.slice(0, 2)), undefined, "an unfinished drive is not counted");
+// A charge reported while Gear still reads D ends the drive; the energy it adds never offsets the drive.
+const noPark = trip.filter(p => p.timestamp.valueOf() !== m(21).valueOf());
+assert.deepEqual(driveConsumption(noPark), { kwh: 5, miles: 20, drives: 2, regenKwh: 1 });
 console.log("analytics ok");
