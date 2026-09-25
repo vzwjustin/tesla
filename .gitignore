@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+telemetry*.jsonl
+*.pem
+*.key
+.DS_Store
+__pycache__/

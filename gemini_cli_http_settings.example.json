@@ -1,0 +1,15 @@
+{
+  "mcp": {
+    "allowed": ["tesla-battery-dashboard"]
+  },
+  "mcpServers": {
+    "tesla-battery-dashboard": {
+      "httpUrl": "http://127.0.0.1:4761/mcp",
+      "headers": {
+        "Authorization": "Bearer $TESLA_HTTP_MCP_TOKEN"
+      },
+      "trust": false,
+      "timeout": 30000
+    }
+  }
+}

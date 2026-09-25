@@ -1,0 +1,30 @@
+{
+  "name": "tesla-battery-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-only local stdio MCP server for Tesla Fleet API battery, charging, and Fleet Telemetry analysis.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "oauth": "node dist/oauth.js",
+    "smoke": "node dist/smoke.js",
+    "dashboard": "node dist/dashboardServer.js",
+    "http-mcp": "node dist/httpMcpServer.js",
+    "smoke:http": "node dist/httpSmoke.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "serialport": "^13.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
+  }
+}

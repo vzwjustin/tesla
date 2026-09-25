@@ -1,0 +1,349 @@
+import { execFile } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { buildDashboard, historySeries, recordFromLive, recordFromTelemetry } from "./analysis.js";
+import { getHealthReferences } from "./degradation.js";
+import { buildHealthModelSuite, defaultHealthModelOptions } from "./healthModels.js";
+import { importBmsDiagnosticFile, type BmsDiagnosticSnapshot } from "./scanMyTesla.js";
+import { capturePassiveElmCan } from "./serialCan.js";
+import { getAccessToken, getVehicleData, listVehicles, resolveVin } from "./teslaApi.js";
+import { mergeLatest, readTelemetry } from "./telemetry.js";
+import type { TelemetryPoint } from "./types.js";
+import { energySocFit, estimateSoh, sohObservations, sohReferences, sohScenarios, type SohEstimate } from "./soh.js";
+
+export type DashboardSummary = {
+  generatedAt: string;
+  vehicle: { vin: string; displayName?: string; state?: string };
+  sources: Array<{ id: string; label: string; status: "available" | "not_configured" | "unavailable"; detail: string }>;
+  latest: Record<string, unknown>;
+  health?: Record<string, unknown>;
+  rawSignals?: Record<string, unknown>;
+  rawTimestamp?: string;
+  history?: unknown[];
+  syncResult?: string;
+  analytics?: Record<string, unknown>;
+  series?: Record<string, Array<[number, number]>>;
+  warranty?: unknown;
+  soh?: SohEstimate;
+  sohScenarios?: unknown;
+  charging?: unknown;
+  chargeSessions?: unknown;
+  alerts?: unknown;
+  optionalBms?: BmsDiagnosticSnapshot;
+  optionalBmsError?: string;
+};
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// PackVoltage reads ~4 V while the HV contactors are open (car asleep); those samples are not pack voltage.
+const num = (point: TelemetryPoint, key: string) => { const v = point.signals[key]; return typeof v === "number" && Number.isFinite(v) && !(key === "PackVoltage" && v < 100) ? v : undefined; };
+const round = (value: number, digits = 3) => Number(value.toFixed(digits));
+const median = (values: number[]) => { const s = [...values].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2; };
+
+// Chart series, thinned to at most 400 samples each.
+function buildSeries(points: TelemetryPoint[]): Record<string, Array<[number, number]>> {
+  const pick = (f: (p: TelemetryPoint) => number | undefined) => {
+    const all = points.flatMap(p => { const v = f(p); return v === undefined ? [] : [[p.timestamp.valueOf(), round(v, 3)] as [number, number]]; });
+    const step = Math.ceil(all.length / 400) || 1;
+    return all.filter((_, k) => k % step === 0 || k === all.length - 1);
+  };
+  const both = (a: string, b: string, f: (x: number, y: number) => number) => (p: TelemetryPoint) => { const x = num(p, a), y = num(p, b); return x === undefined || y === undefined ? undefined : f(x, y); };
+  return {
+    soc: pick(p => num(p, "Soc")),
+    powerKw: pick(both("PackVoltage", "PackCurrent", (v, i) => v * i / 1000)),
+    brickSpreadMv: pick(both("BrickVoltageMax", "BrickVoltageMin", (a, b) => (a - b) * 1000)),
+    moduleTempMin: pick(p => num(p, "ModuleTempMin")),
+    moduleTempMax: pick(p => num(p, "ModuleTempMax")),
+  };
+}
+
+// Warranty rarely changes; cache a day. Failure only hides the tile.
+let warrantyCache: { at: number; data: unknown } | undefined;
+async function getWarranty(vin: string): Promise<unknown> {
+  if (warrantyCache && Date.now() - warrantyCache.at < 86_400_000) return warrantyCache.data;
+  const base = process.env.TESLA_BASE_URL?.trim() || "https://fleet-api.prd.na.vn.cloud.tesla.com";
+  const response = await fetch(`${base}/api/1/dx/warranty/details?vin=${encodeURIComponent(vin)}`, { headers: { Authorization: `Bearer ${await getAccessToken()}` } });
+  if (!response.ok) throw new Error(`warranty lookup failed: HTTP ${response.status}`);
+  warrantyCache = { at: Date.now(), data: await response.json() };
+  return warrantyCache.data;
+}
+
+// Charge sessions reconstructed from telemetry history (TeslaFi / Tessie / Fleet Telemetry).
+// A session is a run of ChargeState Charging/Starting, ended by any other state or a >30 min gap.
+//   wall kWh : ∫ ChargerPower dt (AC input side; steps capped at 10 min)
+//   pack kWh : ΔEnergyRemaining          efficiency = pack ÷ wall
+//   implied full pack = pack kWh ÷ ΔSOC × 100 (usable basis; sessions with ΔSOC ≥ 20 only)
+// Home = TESLA_HOME_LATLON if set, else the most common ~100 m cell among AC session locations.
+export function chargeSessionsFrom(points: TelemetryPoint[]): Record<string, unknown> {
+  type S = { start: number; end: number; soc0?: number; soc1?: number; e0?: number; e1?: number; wall: number; peakKw: number; lat?: number; lon?: number; added?: number };
+  const sessions: S[] = [];
+  let cur: S | undefined, lastT = 0, lastKw = 0, soc: number | undefined, energy: number | undefined, lat: number | undefined, lon: number | undefined;
+  const close = () => { if (cur && cur.end - cur.start >= 5 * 60_000) sessions.push(cur); cur = undefined; };
+  for (const p of points) {
+    const t = p.timestamp.valueOf(), st = p.signals.ChargeState;
+    soc = num(p, "Soc") ?? soc; energy = num(p, "EnergyRemaining") ?? energy; lat = num(p, "Latitude") ?? lat; lon = num(p, "Longitude") ?? lon;
+    const charging = st === "Charging" || st === "Starting";
+    if (cur && t - lastT > 30 * 60_000) close();
+    if (charging) {
+      if (!cur) cur = { start: t, end: t, soc0: soc, e0: energy, wall: 0, peakKw: 0, lat, lon };
+      else cur.wall += lastKw * Math.min(t - lastT, 600_000) / 3_600_000;
+      const kw = num(p, "ChargerPower") ?? num(p, "AcChargingPower") ?? num(p, "DcChargingPower");
+      if (kw !== undefined) lastKw = kw;
+      cur.peakKw = Math.max(cur.peakKw, lastKw); cur.end = t; cur.soc1 = soc; cur.e1 = energy;
+      const added = num(p, "AddedEnergy"); if (added !== undefined) cur.added = Math.max(cur.added ?? 0, added);
+    } else if (typeof st === "string") { if (cur) { cur.soc1 = soc; cur.e1 = energy; } close(); }
+    lastT = t;
+  }
+  close();
+  const cell = (a?: number, b?: number) => a === undefined || b === undefined ? undefined : `${a.toFixed(3)},${b.toFixed(3)}`;
+  const envHome = process.env.TESLA_HOME_LATLON?.split(",").map(Number);
+  let home: string | undefined = envHome?.length === 2 ? cell(envHome[0], envHome[1]) : undefined;
+  if (!home) { const c: Record<string, number> = {}; for (const s of sessions) { const k = cell(s.lat, s.lon); if (k && s.peakKw < 25) c[k] = (c[k] || 0) + 1; } home = Object.entries(c).sort((a, b) => b[1] - a[1])[0]?.[0]; }
+  const near = (s: S) => { if (!home || s.lat === undefined || s.lon === undefined) return false; const [a, b] = home.split(",").map(Number); return Math.hypot((s.lat - a!) * 111, (s.lon - b!) * 111 * Math.cos(a! * Math.PI / 180)) < 0.3; };
+  const rate = Number(process.env.TESLA_HOME_RATE_PER_KWH) || undefined;
+  const rows = sessions.map(s => {
+    const type = s.peakKw >= 25 ? "DC fast" : near(s) ? "Home" : "Other AC";
+    const pack = s.e0 !== undefined && s.e1 !== undefined ? s.e1 - s.e0 : undefined, dsoc = s.soc0 !== undefined && s.soc1 !== undefined ? s.soc1 - s.soc0 : undefined;
+    const wall = s.added ?? (s.wall > 0 ? s.wall : undefined);
+    return { start: new Date(s.start).toISOString(), end: new Date(s.end).toISOString(), type, minutes: round((s.end - s.start) / 60000, 0), socFrom: s.soc0 === undefined ? undefined : round(s.soc0, 1), socTo: s.soc1 === undefined ? undefined : round(s.soc1, 1),
+      wallKwh: wall === undefined ? undefined : round(wall, 2), packKwh: pack === undefined ? undefined : round(pack, 2), peakKw: round(s.peakKw, 1),
+      // ChargerPower is whole-kW, so short sessions carry ±10–20% integration error; only report ≥5 kWh.
+      efficiencyPct: wall && wall >= 5 && pack && pack >= 3 ? round(100 * pack / wall, 1) : undefined,
+      impliedFullPackKwh: pack && dsoc && dsoc >= 20 ? round(pack / dsoc * 100, 2) : undefined,
+      cost: type === "Home" && rate && wall ? round(wall * rate, 2) : undefined };
+  }).reverse();
+  const homeRows = rows.filter(r => r.type === "Home");
+  const sum = (xs: Array<number | undefined>) => round(xs.reduce<number>((a, x) => a + (x ?? 0), 0), 1);
+  const implied = rows.map(r => r.impliedFullPackKwh).filter((v): v is number => v !== undefined);
+  const eff = homeRows.map(r => r.efficiencyPct).filter((v): v is number => v !== undefined);
+  return {
+    source: "reconstructed from telemetry history (ChargeState runs); wall kWh = ∫ChargerPower dt, pack kWh = ΔEnergyRemaining",
+    homeLocated: Boolean(home), homeBasis: envHome?.length === 2 ? "TESLA_HOME_LATLON" : "most frequent AC charging location",
+    sessions: rows.length, home: { sessions: homeRows.length, wallKwh: sum(homeRows.map(r => r.wallKwh)), packKwh: sum(homeRows.map(r => r.packKwh)), medianEfficiencyPct: eff.length ? round(median(eff), 1) : undefined, ...(rate ? { cost: sum(homeRows.map(r => r.cost)), ratePerKwh: rate } : {}) },
+    capacityCrossCheck: implied.length ? { impliedUsableKwh: round(median(implied), 2), sessions: implied.length, min: Math.min(...implied), max: Math.max(...implied), basis: "median ΔEnergyRemaining ÷ ΔSOC × 100 over sessions with ΔSOC ≥ 20" } : undefined,
+    rows,
+  };
+}
+
+// Vehicle alerts (Fleet API recent_alerts). Account-level call; does not wake the car. Cached 10 min.
+// Battery-relevant prefixes: BMS_ (battery management), CP_ (charge port), CC_/UMC_ (charge cable/connector), THC_ (thermal).
+let alertCache: { at: number; data: unknown } | undefined;
+async function getAlerts(vin: string): Promise<unknown> {
+  if (alertCache && Date.now() - alertCache.at < 600_000) return alertCache.data;
+  const base = process.env.TESLA_BASE_URL?.trim() || "https://fleet-api.prd.na.vn.cloud.tesla.com";
+  const response = await fetch(`${base}/api/1/vehicles/${encodeURIComponent(vin)}/recent_alerts`, { headers: { Authorization: `Bearer ${await getAccessToken()}` } });
+  if (!response.ok) throw new Error(`recent_alerts failed: HTTP ${response.status}`);
+  const body = await response.json() as { response?: { recent_alerts?: Array<{ name: string; time: string; user_text?: string; audiences?: string[] }> } };
+  const rows = (body.response?.recent_alerts || []).map(a => ({ name: a.name, time: new Date(a.time).toISOString(), text: a.user_text, battery: /^(BMS|CP|CC|UMC|THC|VCFRONT_a\d+_.*(12V|HV))/i.test(a.name) }));
+  alertCache = { at: Date.now(), data: { total: rows.length, batteryRelated: rows.filter(r => r.battery).length, rows } };
+  return alertCache.data;
+}
+
+// Supercharger session history (Tesla dx/charging/history; needs vehicle_charging_cmds). Cached 1 h.
+let chargingCache: { at: number; data: unknown } | undefined;
+async function getChargingHistory(vin: string): Promise<unknown> {
+  if (chargingCache && Date.now() - chargingCache.at < 3_600_000) return chargingCache.data;
+  const base = process.env.TESLA_BASE_URL?.trim() || "https://fleet-api.prd.na.vn.cloud.tesla.com";
+  const token = await getAccessToken();
+  type Fee = { feeType: string; usageBase?: number; usageTier1?: number; usageTier2?: number; totalDue?: number; netDue?: number; currencyCode?: string; uom?: string };
+  type Session = { sessionId: number; siteLocationName?: string; chargeStartDateTime: string; chargeStopDateTime?: string; fees?: Fee[] };
+  const sessions: Session[] = [];
+  for (let page = 1; page <= 20; page++) {
+    const response = await fetch(`${base}/api/1/dx/charging/history?vin=${encodeURIComponent(vin)}&pageNo=${page}&pageSize=50&sortBy=start_datetime&sortOrder=DESC`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) throw new Error(`charging history failed: HTTP ${response.status}`);
+    const body = await response.json() as { data?: Session[] };
+    sessions.push(...(body.data || []));
+    if ((body.data || []).length < 50) break;
+  }
+  const rows = sessions.map(s => {
+    const charge = (s.fees || []).find(f => f.feeType === "CHARGING");
+    const kwh = charge?.uom === "kwh" ? (charge.usageBase || 0) + (charge.usageTier1 || 0) + (charge.usageTier2 || 0) : undefined;
+    const cost = (s.fees || []).reduce((a, f) => a + (f.netDue ?? f.totalDue ?? 0), 0);
+    const minutes = s.chargeStopDateTime ? (Date.parse(s.chargeStopDateTime) - Date.parse(s.chargeStartDateTime)) / 60000 : undefined;
+    return { start: s.chargeStartDateTime, site: s.siteLocationName, kwh: kwh === undefined ? undefined : round(kwh, 2), cost: round(cost, 2), currency: charge?.currencyCode, minutes: minutes === undefined ? undefined : round(minutes, 0), avgKw: kwh && minutes ? round(kwh / (minutes / 60), 1) : undefined };
+  });
+  const kwhTotal = rows.reduce((a, r) => a + (r.kwh || 0), 0), costTotal = rows.reduce((a, r) => a + r.cost, 0);
+  chargingCache = { at: Date.now(), data: { source: "Tesla Supercharger history (dx/charging/history); home/AC charging is not included", sessions: rows.length, kwhTotal: round(kwhTotal, 1), costTotal: round(costTotal, 2), avgCostPerKwh: kwhTotal ? round(costTotal / kwhTotal, 3) : undefined, rows } };
+  return chargingCache.data;
+}
+
+// Derived, clearly-labelled estimates from the telemetry window. Each returns undefined when evidence is insufficient.
+export function computeAnalytics(points: TelemetryPoint[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+
+  // Capacity from the SOC swing: EnergyRemaining = slope·Soc + buffer. slope×100 = usable full pack.
+  const fit = energySocFit(points);
+  const atFull = points.flatMap(p => { const e = num(p, "EnergyRemaining"), s = num(p, "Soc"); return e !== undefined && s !== undefined && s >= 99.5 ? [e] : []; });
+  const nominalAt100 = atFull.length ? median(atFull) : undefined;
+  if (fit && fit.socSpan >= 20) out.capacityFromSocSwing = { usableKwh: round(fit.usableKwh, 2), bufferKwh: round(nominalAt100 !== undefined ? nominalAt100 - fit.usableKwh : fit.bufferKwh, 2), bufferInclusiveKwh: round(nominalAt100 ?? fit.usableKwh + fit.bufferKwh, 2), bufferBasis: nominalAt100 !== undefined ? `EnergyRemaining at ≥99.5% SOC (${atFull.length} samples) − usable` : "fit intercept at 0% SOC", fitInterceptKwh: round(fit.bufferKwh, 2), rSquared: round(fit.rSquared, 4), samples: fit.samples, socSpanPct: round(fit.socSpan, 1), method: "least-squares EnergyRemaining vs Soc" };
+  else if (fit) out.capacityFromSocSwing = { status: "needs ≥20% SOC swing", samples: fit.samples, socSpanPct: round(fit.socSpan, 1) };
+  const nominal = points.map(p => num(p, "NominalFullPackEnergyKwh")).filter((v): v is number => v !== undefined);
+  if (nominal.length) out.bmsNominalFullPackKwh = { latest: nominal.at(-1), min: Math.min(...nominal), max: Math.max(...nominal) };
+
+  // Lifetime counter deltas across the window.
+  const delta = (key: string) => { const v = points.map(p => num(p, key)).filter((x): x is number => x !== undefined); return v.length >= 2 ? round(v.at(-1)! - v[0]!, 3) : undefined; };
+  const counters = Object.fromEntries(["LifetimeEnergyUsed", "LifetimeEnergyUsedDrive", "LifetimeEnergyGainedRegen", "LifetimeEnergyChargedKwh", "ACChargingEnergyIn", "DCChargingEnergyIn", "Odometer"].map(k => [k, delta(k)]).filter(([, v]) => v !== undefined));
+  if (Object.keys(counters).length) out.windowDeltas = counters;
+  const drive = counters.LifetimeEnergyUsedDrive as number | undefined, regen = counters.LifetimeEnergyGainedRegen as number | undefined;
+  if (drive && regen !== undefined) out.regenRecoveredPct = round(regen / drive * 100, 1);
+
+  // Consumption from lifetime counters: Δenergy ÷ Δodometer over the window. EnergyRemaining updates
+  // less often than Odometer, so per-interval EnergyRemaining deltas undercount. Drive-only counter
+  // preferred; LifetimeEnergyUsed also includes parked use (HVAC, Sentry, standby).
+  const span = (key: string) => { const v = points.flatMap(p => { const x = num(p, key); return x === undefined ? [] : [x]; }); return v.length >= 2 ? v.at(-1)! - v[0]! : undefined; };
+  const miles = span("Odometer"), driveKwh = span("LifetimeEnergyUsedDrive"), totalKwh = span("LifetimeEnergyUsed");
+  if (miles && miles >= 1 && (driveKwh || totalKwh)) out.consumption = {
+    whPerMile: round((driveKwh ?? totalKwh!) / miles * 1000, 0),
+    basis: driveKwh ? "ΔLifetimeEnergyUsedDrive ÷ ΔOdometer (driving only)" : "ΔLifetimeEnergyUsed ÷ ΔOdometer (includes parked use)",
+    ...(totalKwh ? { allInWhPerMile: round(totalKwh / miles * 1000, 0) } : {}),
+    kwhUsed: round(driveKwh ?? totalKwh!, 1),
+    miles: round(miles, 1),
+  };
+  // Quick pack resistance: −ΔV/ΔI between same-record samples ≤30 s apart with ≥30 A current step.
+  // ponytail: crude step-response estimate; the resistance health model is the rigorous version.
+  const vi = points.flatMap(p => { const v = num(p, "PackVoltage"), i = num(p, "PackCurrent"); return v !== undefined && i !== undefined ? [{ t: p.timestamp.valueOf(), v, i }] : []; });
+  const rs: number[] = [];
+  for (let k = 1; k < vi.length; k++) { const a = vi[k - 1]!, b = vi[k]!, di = b.i - a.i; if (b.t - a.t <= 30_000 && Math.abs(di) >= 30) { const r = -(b.v - a.v) / di; if (r > 0 && r < 1) rs.push(r); } }
+  out.packResistance = rs.length >= 3 ? { milliohms: round(median(rs) * 1000, 1), steps: rs.length, method: "median −ΔV/ΔI, current steps ≥30 A" } : { status: "needs load steps (drive or charge start/stop)", steps: rs.length };
+
+  // Imbalance / thermal envelopes over the window.
+  const spreads = points.flatMap(p => { const a = num(p, "BrickVoltageMax"), b = num(p, "BrickVoltageMin"); return a !== undefined && b !== undefined ? [(a - b) * 1000] : []; });
+  if (spreads.length) out.brickSpreadMv = { latest: round(spreads.at(-1)!, 1), min: round(Math.min(...spreads), 1), max: round(Math.max(...spreads), 1), median: round(median(spreads), 1), samples: spreads.length };
+  const temps = points.flatMap(p => { const a = num(p, "ModuleTempMax"), b = num(p, "ModuleTempMin"); return a !== undefined && b !== undefined ? [[b, a] as const] : []; });
+  if (temps.length) out.moduleTempC = { lowest: Math.min(...temps.map(t => t[0])), highest: Math.max(...temps.map(t => t[1])), maxSpread: Math.max(...temps.map(t => t[1] - t[0])) };
+  const power = points.flatMap(p => { const v = num(p, "PackVoltage"), i = num(p, "PackCurrent"); return v !== undefined && i !== undefined ? [v * i / 1000] : []; });
+  if (power.length) out.packPowerKw = { max: round(Math.max(...power), 2), min: round(Math.min(...power), 2), note: "PackVoltage × PackCurrent; sign follows Tesla PackCurrent" };
+  const brickSoc = points.map(p => num(p, "BrickSocMinPercent")).filter((v): v is number => v !== undefined);
+  const soc = points.map(p => num(p, "Soc")).filter((v): v is number => v !== undefined);
+  if (brickSoc.length && soc.length) out.weakestBrickSocGapPct = round(soc.at(-1)! - brickSoc.at(-1)!, 2);
+  // Pack voltage & cell balance. Rest = |PackCurrent| < 2 A (no IR drop).
+  const rest = points.flatMap(p => { const v = num(p, "PackVoltage"), s = num(p, "Soc"), i = num(p, "PackCurrent"); return v !== undefined && s !== undefined && i !== undefined && Math.abs(i) < 2 ? [{ v, s }] : []; });
+  // Bricks in series = PackVoltage ÷ mean brick voltage, from records carrying both.
+  const ratios = points.flatMap(p => { const v = num(p, "PackVoltage"), a = num(p, "BrickVoltageMin"), b = num(p, "BrickVoltageMax"); return v !== undefined && a !== undefined && b !== undefined && a > 2 ? [v / ((a + b) / 2)] : []; });
+  const series = ratios.length ? Math.round(median(ratios)) : undefined;
+  const curve: Array<{ socFrom: number; socTo: number; samples: number; packV: number; perBrickV?: number }> = [];
+  for (let lo = 0; lo < 100; lo += 5) {
+    const hi = lo === 95 ? 100.01 : lo + 5, vs = rest.filter(r => r.s >= lo && r.s < hi).map(r => r.v);
+    if (vs.length >= 3) { const v = median(vs); curve.push({ socFrom: lo, socTo: Math.min(hi, 100), samples: vs.length, packV: round(v, 1), ...(series ? { perBrickV: round(v / series, 3) } : {}) }); }
+  }
+  const full = rest.filter(r => r.s >= 99.5).map(r => r.v);
+  const peak = points.map(p => num(p, "PackVoltage")).filter((v): v is number => v !== undefined);
+  const count = (key: string) => { const c: Record<string, number> = {}; for (const p of points) { const v = num(p, key); if (v !== undefined) c[v] = (c[v] || 0) + 1; } return Object.entries(c).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([brick, n]) => ({ brick: Number(brick), samples: n })); };
+  out.packVoltage = {
+    bricksInSeries: series, bricksInSeriesBasis: series ? `median PackVoltage ÷ mean brick voltage over ${ratios.length} records` : "needs PackVoltage with BrickVoltageMin/Max",
+    restSamples: rest.length, curve,
+    ...(full.length ? { atFullRestV: round(median(full), 1), atFullPerBrickV: series ? round(median(full) / series, 3) : undefined, atFullSamples: full.length } : {}),
+    ...(peak.length ? { peakV: round(Math.max(...peak), 1), peakPerBrickV: series ? round(Math.max(...peak) / series, 3) : undefined, minV: round(Math.min(...peak), 1) } : {}),
+  };
+  out.cellBalance = { lowestBrickMostOften: count("NumBrickVoltageMin"), highestBrickMostOften: count("NumBrickVoltageMax"), thresholdsMv: { healthy: "<10", watch: "10–30", concern: ">30" }, note: "Tesla reports only min/max brick; per-brick voltages need OBD. Imbalance shows best at 100% SOC on LFP." };
+  out.window = { records: points.length, from: points[0]?.timestamp.toISOString(), to: points.at(-1)?.timestamp.toISOString() };
+  return out;
+}
+
+// Pulls the VPS telemetry file down via telemetry.sh before reading. Failure is reported, never fatal.
+async function syncTelemetry(): Promise<string> {
+  const script = join(dirname(fileURLToPath(import.meta.url)), "..", "telemetry.sh");
+  try {
+    const { stdout } = await promisify(execFile)(script, ["sync"], { timeout: 60_000 });
+    return stdout.trim();
+  } catch (error) {
+    return `sync failed: ${errorMessage(error)}`;
+  }
+}
+
+export async function getDashboardSummary(vin?: string, hours = 2160, sync = false): Promise<DashboardSummary> {
+  let syncResult = sync ? await syncTelemetry() : undefined;
+  const target = await resolveVin(vin);
+  const vehicle = (await listVehicles()).find(item => item.vin === target);
+  const sources: DashboardSummary["sources"] = [];
+  let latest: Record<string, unknown>;
+  let health: Record<string, unknown> | undefined;
+  let rawSignals: Record<string, unknown> | undefined;
+  let rawTimestamp: string | undefined;
+  let history: unknown[] | undefined;
+  let analytics: Record<string, unknown> | undefined;
+  let series: DashboardSummary["series"];
+  let soh: SohEstimate | undefined;
+  let scenarios: unknown;
+  let chargeSessions: Record<string, unknown> | undefined;
+
+  try {
+    const telemetry = await readTelemetry(target, hours);
+    if (syncResult) syncResult += ` · ${telemetry.length} total with imported history`;
+    const point = mergeLatest(telemetry);
+    if (!point) throw new Error("No qualifying local Fleet Telemetry records were found.");
+    latest = buildDashboard(recordFromTelemetry(point)) as unknown as Record<string, unknown>;
+    rawSignals = point.signals;
+    rawTimestamp = point.timestamp.toISOString();
+    const numericFields = [...new Set(telemetry.flatMap(item => Object.keys(item.signals)))].sort();
+    history = historySeries(telemetry, numericFields);
+    analytics = computeAnalytics(telemetry);
+    series = buildSeries(telemetry);
+    chargeSessions = chargeSessionsFrom(telemetry);
+    const refs = await sohReferences(target);
+    soh = estimateSoh(telemetry, refs, sohObservations());
+    scenarios = sohScenarios(telemetry, soh, refs);
+    health = buildHealthModelSuite(target, telemetry, await getHealthReferences(target), defaultHealthModelOptions);
+    sources.push({ id: "fleetTelemetry", label: "Tesla Fleet Telemetry", status: "available", detail: `${telemetry.length} local record(s) in the selected ${hours}-hour window.` });
+  } catch (telemetryError) {
+    sources.push({ id: "fleetTelemetry", label: "Tesla Fleet Telemetry", status: "not_configured", detail: errorMessage(telemetryError) });
+    const live = await getVehicleData(target);
+    latest = buildDashboard(recordFromLive(target, live)) as unknown as Record<string, unknown>;
+    sources.push({ id: "fleetApi", label: "Tesla Fleet API", status: "available", detail: "One live vehicle_data snapshot. Longitudinal health calculations require local Fleet Telemetry records." });
+  }
+
+  const result: DashboardSummary = {
+    generatedAt: new Date().toISOString(),
+    vehicle: { vin: target, ...(vehicle?.display_name ? { displayName: vehicle.display_name } : {}), ...(vehicle?.state ? { state: vehicle.state } : {}) },
+    sources,
+    latest,
+    ...(health ? { health } : {}),
+    ...(rawSignals ? { rawSignals, rawTimestamp } : {}),
+    ...(history ? { history } : {}),
+    ...(analytics ? { analytics } : {}),
+    ...(series ? { series } : {}),
+    ...(soh ? { soh } : {}),
+    ...(scenarios ? { sohScenarios: scenarios } : {}),
+    ...(chargeSessions ? { chargeSessions } : {}),
+    ...(syncResult ? { syncResult } : {}),
+  };
+
+  try { result.warranty = await getWarranty(target); } catch { /* optional */ }
+  try { result.alerts = await getAlerts(target); } catch (error) { result.alerts = { error: errorMessage(error) }; }
+  try { result.charging = await getChargingHistory(target); } catch (error) { result.charging = { error: errorMessage(error) }; }
+
+  const scanMyTeslaPath = process.env.TESLA_SCANMYTESLA_EXPORT_FILE?.trim();
+  const teslaLoggerPath = process.env.TESLA_TESLALOGGER_EXPORT_FILE?.trim();
+  const directPort = process.env.TESLA_DIRECT_CAN_PORT?.trim();
+  if (!scanMyTeslaPath && !teslaLoggerPath && !directPort) {
+    result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "not_configured", detail: "Optional. Configure a local Scan My Tesla or TeslaLogger export path to show higher-detail BMS evidence." });
+    return result;
+  }
+  try {
+    if (directPort) {
+      const capture = await capturePassiveElmCan({
+        path: directPort,
+        baudRate: Number(process.env.TESLA_DIRECT_CAN_BAUD || 38400),
+        durationSeconds: Number(process.env.TESLA_DIRECT_CAN_SECONDS || 8),
+      });
+      result.optionalBms = capture.snapshot;
+      result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "available", detail: `On-demand passive CAN capture: ${capture.frameCount} frame(s); ${capture.rawLinesDropped} unparsed line(s).` });
+    } else {
+      const path = scanMyTeslaPath || teslaLoggerPath!;
+      const source = scanMyTeslaPath ? "scanmytesla_export" : "teslalogger_export";
+      result.optionalBms = await importBmsDiagnosticFile(path, source);
+      result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "available", detail: `Imported local ${source === "scanmytesla_export" ? "Scan My Tesla" : "TeslaLogger"} diagnostic export.` });
+    }
+  } catch (bmsError) {
+    result.optionalBmsError = errorMessage(bmsError);
+    result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "unavailable", detail: result.optionalBmsError });
+  }
+  return result;
+}
+
+export async function getDashboardVehicleList() {
+  return (await listVehicles()).map(vehicle => ({ vin: vehicle.vin, displayName: vehicle.display_name, state: vehicle.state }));
+}

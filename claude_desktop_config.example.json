@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "tesla-battery": {
+      "command": "/absolute/path/to/tesla-battery-mcp/run-mcp.sh"
+    }
+  }
+}

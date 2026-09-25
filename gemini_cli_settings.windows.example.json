@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "allowed": ["tesla-battery"]
+  },
+  "mcpServers": {
+    "tesla-battery": {
+      "command": "C:\\absolute\\path\\to\\tesla-battery-mcp\\run-mcp.cmd",
+      "cwd": "C:\\absolute\\path\\to\\tesla-battery-mcp",
+      "trust": false,
+      "timeout": 30000
+    }
+  }
+}
