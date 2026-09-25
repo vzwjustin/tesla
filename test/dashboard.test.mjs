@@ -50,9 +50,11 @@ assert.equal(byId(attentionItems({}, now)).freshness.level, "info");
 
 // Page: nonce on the only script, script parses, and backslashes survive the template (String.raw).
 const html = dashboardHtml("n0nce");
-assert.equal((html.match(/<script/g) || []).length, 1);
-const js = html.match(/<script nonce="n0nce">([\s\S]*?)<\/script>/)[1];
-new Script(js);
+const scripts = [...html.matchAll(/<script nonce="n0nce">([\s\S]*?)<\/script>/g)].map(match => match[1]);
+assert.equal((html.match(/<script/g) || []).length, scripts.length, "every script carries the nonce");
+assert.equal(scripts.length, 2, "early theme script + page script");
+scripts.forEach(code => new Script(code));
+const js = scripts.at(-1);
 assert.ok(js.includes("replace(/ to \\S+/,'')"));
 
 // CSV export quotes text and defuses spreadsheet formulas.
