@@ -10,6 +10,7 @@ import { capturePassiveElmCan } from "./serialCan.js";
 import { getAccessToken, getVehicleData, listVehicles, resolveVin } from "./teslaApi.js";
 import { mergeLatest, readTelemetry } from "./telemetry.js";
 import type { TelemetryPoint } from "./types.js";
+import { systemFaults, vehicleSystems, type SystemGroup } from "./vehicleSystems.js";
 import { energySocFit, estimateSoh, fullChargeEvents, sohObservations, sohReferences, sohScenarios, type SohEstimate } from "./soh.js";
 
 export type DashboardSummary = {
@@ -33,6 +34,7 @@ export type DashboardSummary = {
   optionalBms?: BmsDiagnosticSnapshot;
   optionalBmsError?: string;
   attention?: AttentionItem[];
+  systems?: SystemGroup[];
 };
 
 // One line in the dashboard's "needs attention" strip. Levels: ok = checked and fine, info = a suggested
@@ -75,6 +77,9 @@ export function buildSeries(points: TelemetryPoint[], max = 600): Record<string,
     brickSpreadMv: pick(both("BrickVoltageMax", "BrickVoltageMin", (a, b) => (a - b) * 1000)),
     moduleTempMin: pick(p => num(p, "ModuleTempMin")),
     moduleTempMax: pick(p => num(p, "ModuleTempMax")),
+    // Systems tab. Units as in vehicleSystems.ts; tire pressures stay in bar.
+    ...Object.fromEntries(([["statorR", "DiStatorTempR"], ["inverterR", "DiInverterTR"], ["heatsinkR", "DiHeatsinkTR"], ["statorF", "DiStatorTempF"], ["insideC", "InsideTemp"], ["outsideC", "OutsideTemp"],
+      ["tireFl", "TpmsPressureFl"], ["tireFr", "TpmsPressureFr"], ["tireRl", "TpmsPressureRl"], ["tireRr", "TpmsPressureRr"], ["isolationKohm", "IsolationResistance"]] as const).map(([key, field]) => [key, pick(p => num(p, field))])),
   };
 }
 
@@ -282,7 +287,7 @@ async function syncTelemetry(): Promise<string | undefined> {
 
 // "Needs attention" checks. Each uses only evidence already on the dashboard; thresholds that are this
 // dashboard's own screening policy (cell balance) say so. Sorted most severe first.
-export function attentionItems(input: { latestAt?: string; syncResult?: string; chemistry?: string; lastFullChargeAt?: string | null; brickSpreadMedianMv?: number; alerts?: unknown }, now = Date.now()): AttentionItem[] {
+export function attentionItems(input: { latestAt?: string; syncResult?: string; chemistry?: string; lastFullChargeAt?: string | null; brickSpreadMedianMv?: number; alerts?: unknown; systems?: SystemGroup[] }, now = Date.now()): AttentionItem[] {
   const items: AttentionItem[] = [];
   const age = (iso: string) => { const h = (now - Date.parse(iso)) / 3_600_000; return h < 1 ? `${Math.max(0, Math.round(h * 60))} min` : h < 48 ? `${Math.round(h)} h` : `${Math.round(h / 24)} d`; };
   if (!input.latestAt) items.push({ id: "freshness", level: "info", title: "No Fleet Telemetry history", detail: "Showing one live snapshot. Health trends need local Fleet Telemetry records." });
@@ -305,6 +310,12 @@ export function attentionItems(input: { latestAt?: string; syncResult?: string; 
     items.push(recent.length
       ? { id: "alerts", level: "warn", title: `${recent.length} battery/charging alert${recent.length === 1 ? "" : "s"} this week`, detail: [...new Set(recent.map(row => row.text ? `${row.name} (${row.text})` : row.name))].slice(0, 3).join("; ") }
       : { id: "alerts", level: "ok", title: "No battery alerts this week", detail: `${alerts.rows.length} recent vehicle alert(s), none battery or charging related in 7 d.` });
+  }
+  if (input.systems) {
+    const { checked, faults } = systemFaults(input.systems);
+    const ago = (seconds: number) => age(new Date(now - seconds * 1000).toISOString());
+    if (faults.length) items.push({ id: "systemFaults", level: "bad", title: `Car reports ${faults.length === 1 ? "a fault" : `${faults.length} faults`}`, detail: faults.map(r => `${r.label}: ${r.display} (${ago(r.ageSeconds)} ago)`).join("; ") });
+    else if (checked) items.push({ id: "systemFaults", level: "ok", title: "No drive, HV or tire faults reported", detail: `Latest of ${checked} inverter, BMS, HVIL and TPMS state field(s).` });
   }
   const mv = input.brickSpreadMedianMv;
   if (mv !== undefined) items.push({ id: "cellBalance", level: mv < 10 ? "ok" : mv <= 30 ? "warn" : "bad", title: `Cell balance ${mv < 10 ? "healthy" : mv <= 30 ? "worth watching" : "a concern"}`, detail: `Median brick spread ${round(mv, 1)} mV over the window. Screening policy: <10 healthy, 10–30 watch, >30 concern; not Tesla limits.` });
@@ -338,6 +349,7 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
   let scenarios: unknown;
   let chargeSessions: Record<string, unknown> | undefined;
   let lastFullChargeAt: string | null | undefined;
+  let systems: SystemGroup[] | undefined;
 
   try {
     const telemetry = await readTelemetry(target, hours);
@@ -353,6 +365,7 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
     series = buildSeries(telemetry);
     chargeSessions = chargeSessionsFrom(telemetry);
     lastFullChargeAt = fullChargeEvents(telemetry).filter(event => event.completed).at(-1)?.at ?? null;
+    systems = vehicleSystems(telemetry);
     const refs = await sohReferences(target);
     soh = estimateSoh(telemetry, refs, sohObservations());
     scenarios = sohScenarios(telemetry, soh, refs);
@@ -378,6 +391,7 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
     ...(soh ? { soh } : {}),
     ...(scenarios ? { sohScenarios: scenarios } : {}),
     ...(chargeSessions ? { chargeSessions } : {}),
+    ...(systems ? { systems } : {}),
     ...(syncResult ? { syncResult } : {}),
   };
 
@@ -387,7 +401,7 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
 
   await addOptionalBms(result);
   const chemistry = asRecord(analytics?.chemistry).value, spread = asRecord(analytics?.brickSpreadMv).median;
-  result.attention = attentionItems({ latestAt: rawTimestamp, syncResult, chemistry: typeof chemistry === "string" ? chemistry : undefined, lastFullChargeAt, brickSpreadMedianMv: typeof spread === "number" ? spread : undefined, alerts: result.alerts });
+  result.attention = attentionItems({ latestAt: rawTimestamp, syncResult, chemistry: typeof chemistry === "string" ? chemistry : undefined, lastFullChargeAt, brickSpreadMedianMv: typeof spread === "number" ? spread : undefined, alerts: result.alerts, systems });
   return result;
 }
 
