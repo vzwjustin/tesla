@@ -1,5 +1,10 @@
 import { SerialPort } from "serialport";
-import { decodeVerifiedModel3YCan, parseElmCanLine, type BmsDiagnosticSnapshot, type CanFrame } from "./scanMyTesla.js";
+import { decodeVerifiedModel3YCan, EXTENDED_CAN_MESSAGES, parseElmCanLine, type BmsDiagnosticSnapshot, type CanFrame } from "./scanMyTesla.js";
+
+// "battery" = the three battery messages (default). "extended" also listens to each further Scan My Tesla-style
+// message in EXTENDED_CAN_MESSAGES for EXTENDED_SECONDS_PER_ID, about 15 s more in total (10 IDs, 1 s window plus about 0.5 s of adapter commands each).
+export type CaptureProfile = "battery" | "extended";
+const EXTENDED_SECONDS_PER_ID = 1;
 
 export type SerialPortInfo = { path: string; manufacturer?: string; serialNumber?: string; vendorId?: string; productId?: string; pnpId?: string; };
 
@@ -31,7 +36,15 @@ function sleep(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
-export async function capturePassiveElmCan(input: { path: string; baudRate: number; durationSeconds: number }): Promise<{ snapshot: BmsDiagnosticSnapshot; frameCount: number; rawLinesDropped: number; adapterTranscript: string[] }> {
+// Receive-filter phases as [hex CAN ID, seconds]. Battery IDs split durationSeconds; extended IDs add a fixed window each.
+export function capturePhases(durationSeconds: number, profile: CaptureProfile = "battery"): Array<[string, number]> {
+  const battery: Array<[string, number]> = [["352", 0.2 * durationSeconds], ["332", 0.3 * durationSeconds], ["401", 0.5 * durationSeconds]];
+  if (profile !== "extended") return battery;
+  return [...battery, ...Object.keys(EXTENDED_CAN_MESSAGES).map(Number).filter(id => id !== 0x352).map((id): [string, number] => [id.toString(16).toUpperCase(), EXTENDED_SECONDS_PER_ID])];
+}
+
+export async function capturePassiveElmCan(input: { path: string; baudRate: number; durationSeconds: number; profile?: CaptureProfile }): Promise<{ snapshot: BmsDiagnosticSnapshot; frameCount: number; rawLinesDropped: number; adapterTranscript: string[]; profile: CaptureProfile }> {
+  const profile = input.profile ?? "battery";
   const port = new SerialPort({ path: input.path, baudRate: input.baudRate, autoOpen: false, lock: true });
   const chunks: string[] = [];
   const transcript: string[] = [];
@@ -65,14 +78,13 @@ export async function capturePassiveElmCan(input: { path: string; baudRate: numb
     }
     // ponytail: one receive filter per ID in turn; unfiltered ATMA overruns ELM327 buffers on the vehicle bus.
     // 0x401 gets half the time because bricks arrive one multiplex group per frame.
-    const phases: Array<[string, number]> = [["352", 0.2], ["332", 0.3], ["401", 0.5]];
-    for (const [id, share] of phases) {
+    for (const [id, seconds] of capturePhases(input.durationSeconds, profile)) {
       for (const command of [`ATCRA${id}\r`, "ATMA\r"]) {
         transcript.push(command.trim());
         await writePort(port, command);
         await sleep(120);
       }
-      await sleep(input.durationSeconds * share * 1000);
+      await sleep(seconds * 1000);
       // A carriage return ends ELM/STN monitor mode. It does not transmit a CAN frame.
       await writePort(port, "\r");
       await sleep(300);
@@ -88,5 +100,6 @@ export async function capturePassiveElmCan(input: { path: string; baudRate: numb
     frameCount: frames.length,
     rawLinesDropped: dropped,
     adapterTranscript: transcript,
+    profile,
   };
 }

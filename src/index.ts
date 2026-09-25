@@ -242,14 +242,15 @@ server.registerTool("tesla_scanmytesla_list_serial_ports", {
 
 server.registerTool("tesla_scanmytesla_capture_passive_can", {
   title: "Capture Model 3/Y BMS data from a passive Bluetooth/serial CAN adapter",
-  description: "Performs a short, on-demand passive ELM/STN CAN monitor capture through a user-selected Windows COM port or macOS serial path. It sends adapter configuration commands only; it never transmits a Tesla CAN frame, wakes the car, or issues a vehicle command. Decodes only verified open Model 3/Y mappings and returns unknown data as untrusted evidence.",
+  description: "Performs a short, on-demand passive ELM/STN CAN monitor capture through a user-selected Windows COM port or macOS serial path. It sends adapter configuration commands only; it never transmits a Tesla CAN frame, wakes the car, or issues a vehicle command. Decodes open model3dbc Model 3/Y mappings and returns unknown data as untrusted evidence. The extended profile adds Scan My Tesla-style signals (pack V/I, BMS limits and thermal, lifetime kWh, DC-DC, charge line, rear inverter), decoded as the DBC defines them but not checked against the car, and takes about 15 s longer.",
   inputSchema: {
     portPath: z.string().min(2).max(260).describe("Windows COM port or macOS serial device path for the paired compatible adapter."),
     baudRate: z.number().int().min(9600).max(1_000_000).default(38400).describe("Adapter serial baud rate. OBDLink/ELM defaults are commonly 38400, but verify the adapter setting."),
-    durationSeconds: z.number().int().min(1).max(20).default(8).describe("Passive CAN capture duration. Maximum 20 seconds to reduce adapter-buffer risk."),
+    durationSeconds: z.number().int().min(1).max(20).default(8).describe("Passive CAN capture duration for the battery messages. Maximum 20 seconds to reduce adapter-buffer risk."),
+    profile: z.enum(["battery", "extended"]).default("battery").describe("battery: energy, extrema and brick voltages. extended: also 10 more Scan My Tesla-style messages, about 1.5 s each."),
   },
-}, async ({ portPath, baudRate, durationSeconds }) => safely(async () => {
-  const capture = await capturePassiveElmCan({ path: portPath, baudRate, durationSeconds });
+}, async ({ portPath, baudRate, durationSeconds, profile }) => safely(async () => {
+  const capture = await capturePassiveElmCan({ path: portPath, baudRate, durationSeconds, profile });
   return {
     ...capture,
     safety: [

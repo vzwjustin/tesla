@@ -421,9 +421,10 @@ async function addOptionalBms(result: DashboardSummary): Promise<void> {
         path: directPort,
         baudRate: Number(process.env.TESLA_DIRECT_CAN_BAUD || 38400),
         durationSeconds: Number(process.env.TESLA_DIRECT_CAN_SECONDS || 8),
+        profile: process.env.TESLA_DIRECT_CAN_PROFILE?.trim() === "extended" ? "extended" : "battery",
       });
       result.optionalBms = capture.snapshot;
-      result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "available", detail: `On-demand passive CAN capture: ${capture.frameCount} frame(s); ${capture.rawLinesDropped} unparsed line(s).` });
+      result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "available", detail: `On-demand passive CAN capture (${capture.profile} profile): ${capture.frameCount} frame(s); ${capture.rawLinesDropped} unparsed line(s).` });
     } else {
       const path = scanMyTeslaPath || teslaLoggerPath!;
       const source = scanMyTeslaPath ? "scanmytesla_export" : "teslalogger_export";
