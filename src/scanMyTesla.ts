@@ -19,11 +19,105 @@ export type BmsDiagnosticSnapshot = {
   moduleTemperatureMinC?: number;
   moduleTemperatureMaxC?: number;
   moduleTemperatureSpreadC?: number;
+  canSignals?: CanSignal[];
   rawFields: Record<string, string | number | boolean | null>;
   provenance: string[];
 };
 
 export type CanFrame = { id: number; data: Uint8Array; receivedAt: string; raw: string };
+export type CanSignal = { id: string; message: string; signal: string; label: string; value: number; unit: string };
+
+// Scan My Tesla-style signals beyond the battery decode, transcribed from joshwardell/model3dbc Model3CAN.dbc
+// (MIT). Each entry is the DBC's start|length@1± (scale,offset), Intel byte order, unchanged; units are the DBC's
+// with SI spelling (KWh → kWh, C → °C, Min → min). 0x352 is
+// already captured for the battery decode; the other IDs are captured only with TESLA_DIRECT_CAN_PROFILE=extended.
+// BattBeginningOfLifeEnergy292 is deliberately left out: like Scan My Tesla's retired "full pack when new", it is
+// not a reliable as-new reference. Front-inverter messages (dual motor only) are not included.
+type SignalDef = readonly [signal: string, label: string, start: number, length: number, signed: boolean, scale: number, offset: number, unit: string];
+export const EXTENDED_CAN_MESSAGES: Record<number, { message: string; signals: SignalDef[] }> = {
+  0x352: { message: "ID352BMS_energyStatus", signals: [
+    ["BMS_expectedEnergyRemaining", "Expected energy remaining", 22, 11, false, 0.1, 0, "kWh"],
+    ["BMS_idealEnergyRemaining", "Ideal energy remaining", 33, 11, false, 0.1, 0, "kWh"],
+    ["BMS_energyToChargeComplete", "Energy to charge complete", 44, 11, false, 0.1, 0, "kWh"],
+    ["BMS_energyBuffer", "Energy buffer", 55, 8, false, 0.1, 0, "kWh"],
+    ["BMS_fullChargeComplete", "Full charge complete", 63, 1, false, 1, 0, ""]] },
+  0x132: { message: "ID132HVBattAmpVolt", signals: [
+    ["BattVoltage132", "Pack voltage", 0, 16, false, 0.01, 0, "V"],
+    ["SmoothBattCurrent132", "Pack current (smoothed)", 16, 16, true, -0.1, 0, "A"],
+    ["ChargeHoursRemaining132", "Charge time remaining", 48, 12, false, 1, 0, "min"]] },
+  0x252: { message: "ID252BMS_powerAvailable", signals: [
+    ["BMS_maxRegenPower", "Max regen power", 0, 16, false, 0.01, 0, "kW"],
+    ["BMS_maxDischargePower", "Max discharge power", 16, 16, false, 0.013, 0, "kW"],
+    ["BMS_maxStationaryHeatPower", "Max stationary heat power", 32, 10, false, 0.01, 0, "kW"],
+    ["BMS_hvacPowerBudget", "HVAC power budget", 50, 10, false, 0.02, 0, "kW"]] },
+  0x292: { message: "ID292BMS_SOC", signals: [
+    ["SOCmin292", "SOC min", 0, 10, false, 0.1, 0, "%"],
+    ["SOCUI292", "SOC shown in car", 10, 10, false, 0.1, 0, "%"],
+    ["SOCmax292", "SOC max", 20, 10, false, 0.1, 0, "%"],
+    ["SOCave292", "SOC average", 30, 10, false, 0.1, 0, "%"],
+    ["BMS_battTempPct", "Battery temperature", 50, 8, false, 0.4, 0, "%"]] },
+  0x2D2: { message: "ID2D2BMSVAlimits", signals: [
+    ["MinVoltage2D2", "Min pack voltage", 0, 16, false, 0.01, 0, "V"],
+    ["MaxVoltage2D2", "Max pack voltage", 16, 16, false, 0.01, 0, "V"],
+    ["MaxChargeCurrent2D2", "Max charge current", 32, 14, false, 0.1, 0, "A"],
+    ["MaxDischargeCurrent2D2", "Max discharge current", 48, 14, false, 0.128, 0, "A"]] },
+  0x312: { message: "ID312BMSthermal", signals: [
+    ["BMSdissipation312", "Pack heat dissipation", 0, 10, false, 0.02, 0, "kW"],
+    ["BMSflowRequest312", "Coolant flow request", 10, 7, false, 0.3, 0, "LPM"],
+    ["BMSinletActiveCoolTarget312", "Inlet target, active cool", 17, 9, false, 0.25, -25, "°C"],
+    ["BMSinletPassiveTarget312", "Inlet target, passive", 26, 9, false, 0.25, -25, "°C"],
+    ["BMSinletActiveHeatTarget312", "Inlet target, active heat", 35, 9, false, 0.25, -25, "°C"],
+    ["BMSminPackTemperature", "Min pack temperature", 44, 9, false, 0.25, -25, "°C"],
+    ["BMSmaxPackTemperature", "Max pack temperature", 53, 9, false, 0.25, -25, "°C"]] },
+  0x3D2: { message: "ID3D2TotalChargeDischarge", signals: [
+    ["TotalDischargeKWh3D2", "Lifetime discharge", 0, 32, false, 0.001, 0, "kWh"],
+    ["TotalChargeKWh3D2", "Lifetime charge", 32, 32, false, 0.001, 0, "kWh"]] },
+  0x2B4: { message: "ID2B4PCS_dcdcRailStatus", signals: [
+    ["PCS_dcdcLvBusVolt", "12 V bus", 0, 10, false, 0.0390625, 0, "V"],
+    ["PCS_dcdcHvBusVolt", "DC-DC HV bus", 10, 12, false, 0.146484, 0, "V"],
+    ["PCS_dcdcLvOutputCurrent", "DC-DC output current", 24, 12, false, 0.1, 0, "A"]] },
+  0x264: { message: "ID264ChargeLineStatus", signals: [
+    ["ChargeLineVoltage264", "Charge line voltage", 0, 14, false, 0.0333, 0, "V"],
+    ["ChargeLineCurrent264", "Charge line current", 14, 9, false, 0.1, 0, "A"],
+    ["ChargeLinePower264", "Charge line power", 24, 8, false, 0.1, 0, "kW"],
+    ["ChargeLineCurrentLimit264", "Charge line current limit", 32, 10, false, 0.1, 0, "A"]] },
+  0x315: { message: "ID315RearInverterTemps", signals: [
+    ["RearTempInvPCB315", "Rear inverter PCB", 0, 8, false, 1, -40, "°C"],
+    ["RearTempInverter315", "Rear inverter", 8, 8, false, 1, -40, "°C"],
+    ["RearTempStator315", "Rear stator", 16, 8, false, 1, -40, "°C"],
+    ["RearTempInvCapbank315", "Rear inverter capacitor bank", 24, 8, false, 1, -40, "°C"],
+    ["RearTempInvHeatsink315", "Rear inverter heatsink", 32, 8, false, 1, -40, "°C"],
+    ["RearTempPctInverter315", "Rear inverter thermal load", 40, 8, false, 0.4, 0, "%"],
+    ["RearTempPctStator315", "Rear stator thermal load", 48, 8, false, 0.4, 0, "%"]] },
+  0x266: { message: "ID266RearInverterPower", signals: [
+    ["RearPower266", "Rear drive power", 0, 11, true, 0.5, 0, "kW"],
+    ["RearHeatPowerOptimal266", "Rear heat power, optimal", 16, 8, false, 0.08, 0, "kW"],
+    ["RearHeatPowerMax266", "Rear heat power, max", 24, 8, false, 0.08, 0, "kW"],
+    ["RearHeatPower266", "Rear heat power", 32, 8, false, 0.08, 0, "kW"],
+    ["RearPowerLimit266", "Rear power limit", 48, 9, false, 1, 0, "kW"]] },
+};
+
+// Latest value of every extended signal in the capture, plus two products Scan My Tesla also shows.
+export function decodeExtendedModel3YCan(frames: CanFrame[]): CanSignal[] {
+  const latest = new Map<string, CanSignal>();
+  for (const frame of frames) {
+    const spec = EXTENDED_CAN_MESSAGES[frame.id];
+    if (!spec) continue;
+    for (const [signal, label, start, length, signed, scale, offset, unit] of spec.signals) {
+      if (frame.data.length * 8 < start + length) continue;
+      let raw = extractLittleEndian(frame.data, start, length);
+      if (signed && raw >= 2 ** (length - 1)) raw -= 2 ** length;
+      const id = `0x${frame.id.toString(16).toUpperCase()}`;
+      latest.set(signal, { id, message: spec.message, signal, label, value: Number((raw * scale + offset).toFixed(6)), unit });
+    }
+  }
+  const get = (signal: string) => latest.get(signal)?.value;
+  const derived: CanSignal[] = [];
+  const volts = get("BattVoltage132"), amps = get("SmoothBattCurrent132"), lvVolts = get("PCS_dcdcLvBusVolt"), lvAmps = get("PCS_dcdcLvOutputCurrent");
+  if (volts !== undefined && amps !== undefined) derived.push({ id: "0x132", message: "derived", signal: "PackPower132", label: "Pack power (voltage × smoothed current, DBC sign)", value: Number((volts * amps / 1000).toFixed(2)), unit: "kW" });
+  if (lvVolts !== undefined && lvAmps !== undefined) derived.push({ id: "0x2B4", message: "derived", signal: "DcdcOutputPower", label: "DC-DC output power (12 V bus × output current)", value: Math.round(lvVolts * lvAmps), unit: "W" });
+  return [...latest.values(), ...derived];
+}
 
 type FlatRecord = Record<string, string | number | boolean | null>;
 
@@ -238,9 +332,11 @@ export function decodeVerifiedModel3YCan(frames: CanFrame[]): BmsDiagnosticSnaps
     moduleTemperatureMinC,
     moduleTemperatureMaxC,
     moduleTemperatureSpreadC: moduleTemperatureMinC !== undefined && moduleTemperatureMaxC !== undefined ? moduleTemperatureMaxC - moduleTemperatureMinC : undefined,
+    canSignals: decodeExtendedModel3YCan(frames),
     rawFields: { decodedFrameCount: frames.length, observedMessageIds: [...new Set(frames.map(frame => `0x${frame.id.toString(16).toUpperCase()}`))].sort().join(", ") },
     provenance: [
       "Direct passive CAN capture decoded with the MIT-licensed joshwardell/model3dbc Model 3/Y mappings: ID 0x352 energy, 0x332 extrema, and 0x401 brick-voltage groups.",
+      "canSignals lists further model3dbc signals (energy buffer and expected remaining from 0x352; with the extended capture profile also pack V/I, BMS limits and thermal, lifetime kWh, DC-DC, charge line, rear inverter). They are decoded as the DBC defines them and have not been checked against this car.",
       "Tesla firmware changes can invalidate decoded signals. Compare values with the Scan My Tesla app before relying on them.",
       "No FullPackWhenNew mapping is used by this decoder; it is neither guessed nor used in constrained calibration.",
     ],

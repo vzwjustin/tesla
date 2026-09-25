@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import type { JsonObject, JsonPrimitive, JsonValue, TelemetryPoint } from "./types.js";
 
@@ -116,17 +116,51 @@ export function aliasesFor(canonical: string): string[] {
   return SIGNAL_ALIASES[canonical] || [canonical];
 }
 
+// Parsed history is cached per (files, VIN, gap setting) and reused until any file's inode, size or mtime
+// changes: an append, a rewrite, or telemetry.sh sync's atomic rename all invalidate it. Re-parsing a large
+// JSONL file dominated every dashboard refresh and chart-range change. The cache holds full history, with
+// gap-filling decided across all of it; the lookback is applied per call on a copy, so callers never alter
+// the cache. Concurrent cold reads share one parse. Least recently used entries beyond CACHE_ENTRIES drop.
+const CACHE_ENTRIES = 4;
+const parseCache = new Map<string, { stamp: string; points: Promise<TelemetryPoint[]> }>();
+
 export async function readTelemetry(vin?: string, lookbackHours?: number, configured = process.env.TESLA_TELEMETRY_FILE?.trim()): Promise<TelemetryPoint[]> {
   if (!configured) {
     throw new Error("TESLA_TELEMETRY_FILE is not configured. Brick/module extrema and history require a local decoded Tesla Fleet Telemetry JSONL file.");
   }
-  // Comma-separated: the live Fleet Telemetry file first, then imported history (e.g. TeslaFi/Tessie export).
-  // Imported files only fill gaps, per field: an imported signal is kept only where no earlier-listed
-  // file reported that same field nearby. Fleet Telemetry is change-based, so fields go quiet independently.
-  const after = lookbackHours ? Date.now() - lookbackHours * 3_600_000 : 0;
+  const paths = configured.split(",").map(item => item.trim()).filter(Boolean);
   const gapMs = Number(process.env.TESLA_TELEMETRY_GAP_MINUTES || 15) * 60_000;
+  const key = JSON.stringify([paths, vin ?? null, gapMs]);
+  // Stat before reading: if a file changes mid-parse, the stored stamp is already stale and the next call re-parses.
+  const stamp = (await Promise.all(paths.map(async path => {
+    try {
+      const info = await stat(expandHome(path));
+      return `${info.ino}:${info.size}:${info.mtimeMs}`;
+    } catch (error) {
+      parseCache.delete(key);
+      throw new Error(`Unable to read TESLA_TELEMETRY_FILE entry ${path}: ${(error as Error).message}`);
+    }
+  }))).join("|");
+  let entry = parseCache.get(key);
+  if (entry?.stamp !== stamp) {
+    const fresh = { stamp, points: parseTelemetry(paths, vin, gapMs) };
+    fresh.points.catch(() => { if (parseCache.get(key) === fresh) parseCache.delete(key); });
+    entry = fresh;
+  }
+  parseCache.delete(key);
+  parseCache.set(key, entry);
+  for (const oldest of parseCache.keys()) { if (parseCache.size <= CACHE_ENTRIES) break; parseCache.delete(oldest); }
+  const points = await entry.points;
+  const after = lookbackHours ? Date.now() - lookbackHours * 3_600_000 : 0;
+  return after ? points.filter(point => point.timestamp.valueOf() >= after) : points.slice();
+}
+
+// Comma-separated: the live Fleet Telemetry file first, then imported history (e.g. TeslaFi/Tessie export).
+// Imported files only fill gaps, per field: an imported signal is kept only where no earlier-listed
+// file reported that same field nearby. Fleet Telemetry is change-based, so fields go quiet independently.
+async function parseTelemetry(paths: string[], vin: string | undefined, gapMs: number): Promise<TelemetryPoint[]> {
   const points: TelemetryPoint[] = [];
-  for (const path of configured.split(",").map(item => item.trim()).filter(Boolean)) {
+  for (const path of paths) {
     let raw: string;
     try {
       raw = await readFile(expandHome(path), "utf8");
@@ -146,7 +180,7 @@ export async function readTelemetry(vin?: string, lookbackHours?: number, config
       try {
         const parsed = JSON.parse(line) as JsonObject;
         const point = toPoint(parsed);
-        if (!point || (vin && point.vin !== vin) || point.timestamp.valueOf() < after) continue;
+        if (!point || (vin && point.vin !== vin)) continue;
         const at = point.timestamp.valueOf();
         const fields = Object.keys(point.signals).filter(field => field !== "Source");
         const missing = fields.filter(field => !nearAny(covered.get(field) ?? [], at, gapMs));
