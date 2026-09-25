@@ -184,7 +184,20 @@ Open the local URL once with the dashboard token, for example:
 http://127.0.0.1:4760/?token=<TESLA_DASHBOARD_TOKEN>
 ```
 
-The first local visit exchanges the query token for a loopback-only HTTP-only cookie. The page’s **Refresh on demand** button makes a fresh read; it does not schedule a background poll. When configured, `TESLA_SCANMYTESLA_EXPORT_FILE`, `TESLA_TESLALOGGER_EXPORT_FILE`, or `TESLA_DIRECT_CAN_PORT` adds optional BMS evidence. The direct CAN setting starts a short passive capture on refresh, so never set it while Scan My Tesla is using the same Bluetooth Classic adapter.
+The first local visit exchanges the query token for a loopback-only HTTP-only cookie. The page’s **Sync & refresh** button (labelled **Refresh** when sync is not configured) makes a fresh read; it does not schedule a background poll. When `TESLA_TELEMETRY_VPS` is set, each refresh first pulls the server’s telemetry file with `telemetry.sh sync`; when it is unset, sync is skipped and the local file is read as is. When configured, `TESLA_SCANMYTESLA_EXPORT_FILE`, `TESLA_TESLALOGGER_EXPORT_FILE`, or `TESLA_DIRECT_CAN_PORT` adds optional BMS evidence. The direct CAN setting starts a short passive capture on refresh, so never set it while Scan My Tesla is using the same Bluetooth Classic adapter.
+
+The dashboard has four tabs:
+
+| Tab | Contents |
+|---|---|
+| **Overview** | A *needs attention* strip, state-of-health scenarios, warranty projection, at-a-glance tiles, telemetry charts with a **24 h / 7 d / 30 d / 90 d** range selector, and pack voltage and cell balance. |
+| **Health** | SOH at each full charge with its fade trend, the SOH calculation, vehicle alerts, health models, derived analytics, and optional direct-BMS evidence. |
+| **Charging** | Energy charged per day by session type (home, other AC, DC fast), reconstructed charge sessions, and Supercharger history, each downloadable as CSV. |
+| **Data** | Export (full summary JSON, sessions CSV, Supercharger CSV), all readings, raw telemetry signals, the history table, warranty, and raw provenance. |
+
+The *needs attention* strip lists only checks backed by data already on the page, each with its evidence: telemetry freshness, a failed sync, battery or charging alerts in the last 7 days, the median brick-voltage spread (a screening policy of <10 / 10–30 / >30 mV, not a Tesla limit), and, for LFP packs, days since the last completed 100% charge. Tesla’s Model 3 manual recommends that LFP packs fully charge to 100% at least once a week; the page detects LFP from brick voltage (peak ≤3.7 V after reaching ≥95% SOC) and shows no such advice for nickel packs.
+
+Chart ranges end at the newest telemetry record rather than the current time, so a sleeping car still shows its last day of data. Series are downsampled to at most 600 points per signal by keeping each bucket’s minimum and maximum, so short peaks such as DC fast-charge power survive. Exports are generated in the browser from data already loaded; nothing is uploaded. The page is served with a per-response Content-Security-Policy nonce, so only its own script can run.
 
 On Windows, use `run-dashboard.cmd`. On macOS or Linux, use `run-dashboard.sh`. The dashboard requires Node.js and the same local private environment file as the stdio MCP. Keep the bind address at `127.0.0.1`; do not expose the dashboard to a network or the public internet.
 
@@ -225,9 +238,10 @@ Run the protocol-level smoke check after building:
 ```bash
 pnpm smoke
 pnpm smoke:http
+pnpm test
 ```
 
-The first check starts the stdio server, runs MCP tool discovery, and verifies that all documented tools are registered. The second validates the token-protected Streamable HTTP MCP companion. Neither calls Tesla or requires vehicle credentials.
+The first check starts the stdio server, runs MCP tool discovery, and verifies that all documented tools are registered. The second validates the token-protected Streamable HTTP MCP companion. `pnpm test` builds and runs the analytics, SOH, CAN, cluster, and dashboard checks against fixtures. None of these call Tesla or require vehicle credentials.
 
 ## Privacy and safety boundaries
 

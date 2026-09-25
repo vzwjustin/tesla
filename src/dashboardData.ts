@@ -10,7 +10,7 @@ import { capturePassiveElmCan } from "./serialCan.js";
 import { getAccessToken, getVehicleData, listVehicles, resolveVin } from "./teslaApi.js";
 import { mergeLatest, readTelemetry } from "./telemetry.js";
 import type { TelemetryPoint } from "./types.js";
-import { energySocFit, estimateSoh, sohObservations, sohReferences, sohScenarios, type SohEstimate } from "./soh.js";
+import { energySocFit, estimateSoh, fullChargeEvents, sohObservations, sohReferences, sohScenarios, type SohEstimate } from "./soh.js";
 
 export type DashboardSummary = {
   generatedAt: string;
@@ -32,7 +32,12 @@ export type DashboardSummary = {
   alerts?: unknown;
   optionalBms?: BmsDiagnosticSnapshot;
   optionalBmsError?: string;
+  attention?: AttentionItem[];
 };
+
+// One line in the dashboard's "needs attention" strip. Levels: ok = checked and fine, info = a suggested
+// action, warn = something may be wrong, bad = likely problem. Every item states its evidence in `detail`.
+export type AttentionItem = { id: string; level: "ok" | "info" | "warn" | "bad"; title: string; detail: string };
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -43,13 +48,26 @@ const num = (point: TelemetryPoint, key: string) => { const v = point.signals[ke
 const round = (value: number, digits = 3) => Number(value.toFixed(digits));
 const median = (values: number[]) => { const s = [...values].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m]! : (s[m - 1]! + s[m]!) / 2; };
 
-// Chart series, thinned to at most 400 samples each.
-function buildSeries(points: TelemetryPoint[]): Record<string, Array<[number, number]>> {
-  const pick = (f: (p: TelemetryPoint) => number | undefined) => {
-    const all = points.flatMap(p => { const v = f(p); return v === undefined ? [] : [[p.timestamp.valueOf(), round(v, 3)] as [number, number]]; });
-    const step = Math.ceil(all.length / 400) || 1;
-    return all.filter((_, k) => k % step === 0 || k === all.length - 1);
-  };
+// Min/max-per-bucket downsampling. Plain every-Nth thinning drops short spikes (a DC fast-charge peak,
+// a brick-spread excursion); keeping each bucket's lowest and highest sample preserves every extreme.
+// Returns at most `max` points, first and last included, in time order.
+export function downsample(data: Array<[number, number]>, max = 600): Array<[number, number]> {
+  if (data.length <= max) return data;
+  const buckets = Math.floor((max - 2) / 2), size = (data.length - 2) / buckets, out = [data[0]!];
+  for (let b = 0; b < buckets; b++) {
+    const from = 1 + Math.floor(b * size), to = 1 + Math.floor((b + 1) * size);
+    let lo = from, hi = from;
+    for (let k = from; k < to; k++) { if (data[k]![1] < data[lo]![1]) lo = k; if (data[k]![1] > data[hi]![1]) hi = k; }
+    out.push(...(lo === hi ? [data[lo]!] : [data[Math.min(lo, hi)]!, data[Math.max(lo, hi)]!]));
+  }
+  out.push(data.at(-1)!);
+  return out;
+}
+
+// Chart series, downsampled to at most `max` samples each.
+export function buildSeries(points: TelemetryPoint[], max = 600): Record<string, Array<[number, number]>> {
+  const pick = (f: (p: TelemetryPoint) => number | undefined) =>
+    downsample(points.flatMap(p => { const v = f(p); return v === undefined ? [] : [[p.timestamp.valueOf(), round(v, 3)] as [number, number]]; }), max);
   const both = (a: string, b: string, f: (x: number, y: number) => number) => (p: TelemetryPoint) => { const x = num(p, a), y = num(p, b); return x === undefined || y === undefined ? undefined : f(x, y); };
   return {
     soc: pick(p => num(p, "Soc")),
@@ -238,13 +256,21 @@ export function computeAnalytics(points: TelemetryPoint[]): Record<string, unkno
     ...(full.length ? { atFullRestV: round(median(full), 1), atFullPerBrickV: series ? round(median(full) / series, 3) : undefined, atFullSamples: full.length } : {}),
     ...(peak.length ? { peakV: round(Math.max(...peak), 1), peakPerBrickV: series ? round(Math.max(...peak) / series, 3) : undefined, minV: round(Math.min(...peak), 1) } : {}),
   };
+  // Chemistry from brick voltage: LFP cells top out near 3.65 V, nickel (NCA/NMC) cells near 4.2 V.
+  // LFP is only claimed once the pack has been seen near full, since a nickel pack also sits below 3.7 V at low SOC.
+  const brickPeak = points.reduce((a, p) => Math.max(a, num(p, "BrickVoltageMax") ?? -Infinity), -Infinity);
+  const socPeak = soc.reduce((a, v) => Math.max(a, v), -Infinity);
+  const chem = brickPeak >= 3.95 ? "NCA/NMC" : brickPeak > 2 && brickPeak <= 3.7 && socPeak >= 95 ? "LFP" : undefined;
+  if (chem) out.chemistry = { value: chem, basis: `peak BrickVoltageMax ${round(brickPeak, 3)} V at up to ${round(socPeak, 1)}% SOC` };
   out.cellBalance = { lowestBrickMostOften: count("NumBrickVoltageMin"), highestBrickMostOften: count("NumBrickVoltageMax"), thresholdsMv: { healthy: "<10", watch: "10–30", concern: ">30" }, note: "Tesla reports only min/max brick; per-brick voltages need OBD. Imbalance shows best at 100% SOC on LFP." };
   out.window = { records: points.length, from: points[0]?.timestamp.toISOString(), to: points.at(-1)?.timestamp.toISOString() };
   return out;
 }
 
 // Pulls the VPS telemetry file down via telemetry.sh before reading. Failure is reported, never fatal.
-async function syncTelemetry(): Promise<string> {
+// Skipped when TESLA_TELEMETRY_VPS is unset: telemetry.sh cannot sync without it, so it would only ever fail.
+async function syncTelemetry(): Promise<string | undefined> {
+  if (!process.env.TESLA_TELEMETRY_VPS?.trim()) return undefined;
   const script = join(dirname(fileURLToPath(import.meta.url)), "..", "telemetry.sh");
   try {
     const { stdout } = await promisify(execFile)(script, ["sync"], { timeout: 60_000 });
@@ -252,6 +278,48 @@ async function syncTelemetry(): Promise<string> {
   } catch (error) {
     return `sync failed: ${errorMessage(error)}`;
   }
+}
+
+// "Needs attention" checks. Each uses only evidence already on the dashboard; thresholds that are this
+// dashboard's own screening policy (cell balance) say so. Sorted most severe first.
+export function attentionItems(input: { latestAt?: string; syncResult?: string; chemistry?: string; lastFullChargeAt?: string | null; brickSpreadMedianMv?: number; alerts?: unknown }, now = Date.now()): AttentionItem[] {
+  const items: AttentionItem[] = [];
+  const age = (iso: string) => { const h = (now - Date.parse(iso)) / 3_600_000; return h < 1 ? `${Math.max(0, Math.round(h * 60))} min` : h < 48 ? `${Math.round(h)} h` : `${Math.round(h / 24)} d`; };
+  if (!input.latestAt) items.push({ id: "freshness", level: "info", title: "No Fleet Telemetry history", detail: "Showing one live snapshot. Health trends need local Fleet Telemetry records." });
+  else if (now - Date.parse(input.latestAt) > 24 * 3_600_000) items.push({ id: "freshness", level: "warn", title: `Latest car data is ${age(input.latestAt)} old`, detail: "Normal while the car sleeps. If it has been driven or charged since, check the telemetry server (telemetry.sh status) and sync." });
+  else items.push({ id: "freshness", level: "ok", title: `Car data ${age(input.latestAt)} old`, detail: `Latest Fleet Telemetry record ${input.latestAt}.` });
+  if (input.syncResult?.startsWith("sync failed")) {
+    const reason = input.syncResult.split(" · ")[0]!.split("\n").map(line => line.trim()).filter(Boolean).at(-1)!.replace(/^sync failed:\s*/, "");
+    items.push({ id: "sync", level: "warn", title: "Telemetry sync failed", detail: `${reason.slice(0, 200)} Showing the last local copy.` });
+  }
+  // Tesla's Model 3/Y manual: with an LFP battery, keep the limit at 100% and fully charge to 100% at least once a week.
+  if (input.chemistry === "LFP" && input.lastFullChargeAt !== undefined) {
+    const days = input.lastFullChargeAt ? (now - Date.parse(input.lastFullChargeAt)) / 86_400_000 : undefined;
+    if (days === undefined) items.push({ id: "fullCharge", level: "info", title: "No completed 100% charge in this window", detail: "Tesla recommends LFP packs reach 100% at least once a week (BMS calibration). It also anchors the SOH estimate. Check Controls > Charging for your car's current guidance." });
+    else if (days > 7) items.push({ id: "fullCharge", level: "info", title: `Last 100% charge was ${Math.floor(days)} d ago`, detail: "Tesla recommends LFP packs reach 100% at least once a week so the BMS can recalibrate. Check Controls > Charging for your car's current guidance." });
+    else items.push({ id: "fullCharge", level: "ok", title: "Weekly 100% charge done", detail: `Last completed full charge ${age(input.lastFullChargeAt!)} ago.` });
+  }
+  const alerts = input.alerts as { error?: string; rows?: Array<{ name: string; time: string; text?: string; battery?: boolean }> } | undefined;
+  if (alerts?.rows) {
+    const recent = alerts.rows.filter(row => row.battery && now - Date.parse(row.time) <= 7 * 86_400_000);
+    items.push(recent.length
+      ? { id: "alerts", level: "warn", title: `${recent.length} battery/charging alert${recent.length === 1 ? "" : "s"} this week`, detail: [...new Set(recent.map(row => row.text ? `${row.name} (${row.text})` : row.name))].slice(0, 3).join("; ") }
+      : { id: "alerts", level: "ok", title: "No battery alerts this week", detail: `${alerts.rows.length} recent vehicle alert(s), none battery or charging related in 7 d.` });
+  }
+  const mv = input.brickSpreadMedianMv;
+  if (mv !== undefined) items.push({ id: "cellBalance", level: mv < 10 ? "ok" : mv <= 30 ? "warn" : "bad", title: `Cell balance ${mv < 10 ? "healthy" : mv <= 30 ? "worth watching" : "a concern"}`, detail: `Median brick spread ${round(mv, 1)} mV over the window. Screening policy: <10 healthy, 10–30 watch, >30 concern; not Tesla limits.` });
+  const rank = { bad: 0, warn: 1, info: 2, ok: 3 };
+  return items.sort((a, b) => rank[a.level] - rank[b.level]);
+}
+
+// Chart series for the most recent `hours` of telemetry, anchored to the newest record rather than the
+// wall clock so a car that has been asleep still shows its last day of data.
+export async function getDashboardSeries(vin: string | undefined, hours: number) {
+  const target = await resolveVin(vin);
+  const points = await readTelemetry(target, Math.max(hours, 2160));
+  const to = points.at(-1)?.timestamp.valueOf();
+  const window = to === undefined ? [] : points.filter(point => point.timestamp.valueOf() >= to - hours * 3_600_000);
+  return { hours, records: window.length, from: window[0]?.timestamp.toISOString(), to: window.at(-1)?.timestamp.toISOString(), series: buildSeries(window) };
 }
 
 export async function getDashboardSummary(vin?: string, hours = 2160, sync = false): Promise<DashboardSummary> {
@@ -269,6 +337,7 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
   let soh: SohEstimate | undefined;
   let scenarios: unknown;
   let chargeSessions: Record<string, unknown> | undefined;
+  let lastFullChargeAt: string | null | undefined;
 
   try {
     const telemetry = await readTelemetry(target, hours);
@@ -283,6 +352,7 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
     analytics = computeAnalytics(telemetry);
     series = buildSeries(telemetry);
     chargeSessions = chargeSessionsFrom(telemetry);
+    lastFullChargeAt = fullChargeEvents(telemetry).filter(event => event.completed).at(-1)?.at ?? null;
     const refs = await sohReferences(target);
     soh = estimateSoh(telemetry, refs, sohObservations());
     scenarios = sohScenarios(telemetry, soh, refs);
@@ -315,12 +385,21 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
   try { result.alerts = await getAlerts(target); } catch (error) { result.alerts = { error: errorMessage(error) }; }
   try { result.charging = await getChargingHistory(target); } catch (error) { result.charging = { error: errorMessage(error) }; }
 
+  await addOptionalBms(result);
+  const chemistry = asRecord(analytics?.chemistry).value, spread = asRecord(analytics?.brickSpreadMv).median;
+  result.attention = attentionItems({ latestAt: rawTimestamp, syncResult, chemistry: typeof chemistry === "string" ? chemistry : undefined, lastFullChargeAt, brickSpreadMedianMv: typeof spread === "number" ? spread : undefined, alerts: result.alerts });
+  return result;
+}
+
+const asRecord = (value: unknown): Record<string, unknown> => value && typeof value === "object" ? value as Record<string, unknown> : {};
+
+async function addOptionalBms(result: DashboardSummary): Promise<void> {
   const scanMyTeslaPath = process.env.TESLA_SCANMYTESLA_EXPORT_FILE?.trim();
   const teslaLoggerPath = process.env.TESLA_TESLALOGGER_EXPORT_FILE?.trim();
   const directPort = process.env.TESLA_DIRECT_CAN_PORT?.trim();
   if (!scanMyTeslaPath && !teslaLoggerPath && !directPort) {
     result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "not_configured", detail: "Optional. Configure a local Scan My Tesla or TeslaLogger export path to show higher-detail BMS evidence." });
-    return result;
+    return;
   }
   try {
     if (directPort) {
@@ -341,7 +420,6 @@ export async function getDashboardSummary(vin?: string, hours = 2160, sync = fal
     result.optionalBmsError = errorMessage(bmsError);
     result.sources.push({ id: "directBms", label: "Scan My Tesla / Direct BMS", status: "unavailable", detail: result.optionalBmsError });
   }
-  return result;
 }
 
 export async function getDashboardVehicleList() {

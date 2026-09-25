@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
-import { getDashboardSummary, getDashboardVehicleList } from "./dashboardData.js";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { getDashboardSeries, getDashboardSummary, getDashboardVehicleList } from "./dashboardData.js";
 import { getClusterSnapshot } from "./clusterData.js";
 import { clusterHtml } from "./clusterPage.js";
 import { dashboardHtml } from "./dashboardPage.js";
@@ -47,9 +47,20 @@ const server = createServer(async (request, response) => {
     try { return sendJson(response, 200, await getClusterSnapshot()); }
     catch { return sendJson(response, 503, { error: "Telemetry unavailable" }); }
   }
-  if (url.pathname === "/") { response.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Frame-Options": "DENY" }); response.end(dashboardHtml()); return; }
+  if (url.pathname === "/") {
+    // Per-response nonce: only this page's own inline script may run, so an unescaped value from telemetry,
+    // an alert, or a Supercharger site name cannot execute script alongside the dashboard cookie.
+    const nonce = randomBytes(18).toString("base64");
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` });
+    response.end(dashboardHtml(nonce)); return;
+  }
   if (url.pathname === "/api/summary") {
     try { return sendJson(response, 200, await getDashboardSummary(url.searchParams.get("vin") || undefined, Number(url.searchParams.get("hours")) || 2160, url.searchParams.get("sync") === "1")); } catch (error) { return sendJson(response, 502, { error: error instanceof Error ? error.message : String(error) }); }
+  }
+  if (url.pathname === "/api/series") {
+    const hours = Math.min(8760, Math.max(1, Number(url.searchParams.get("hours")) || 168));
+    try { return sendJson(response, 200, await getDashboardSeries(url.searchParams.get("vin") || undefined, hours)); } catch (error) { return sendJson(response, 502, { error: error instanceof Error ? error.message : String(error) }); }
   }
   if (url.pathname === "/api/vehicles") { try { return sendJson(response, 200, await getDashboardVehicleList()); } catch (error) { return sendJson(response, 502, { error: error instanceof Error ? error.message : String(error) }); } }
   return sendJson(response, 404, { error: "Not found" });
