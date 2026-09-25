@@ -197,7 +197,7 @@ The dashboard has four tabs:
 
 The *needs attention* strip lists only checks backed by data already on the page, each with its evidence: telemetry freshness, a failed sync, battery or charging alerts in the last 7 days, the median brick-voltage spread (a screening policy of <10 / 10–30 / >30 mV, not a Tesla limit), and, for LFP packs, days since the last completed 100% charge. Tesla’s Model 3 manual recommends that LFP packs fully charge to 100% at least once a week; the page detects LFP from brick voltage (peak ≤3.7 V after reaching ≥95% SOC) and shows no such advice for nickel packs.
 
-Chart ranges end at the newest telemetry record rather than the current time, so a sleeping car still shows its last day of data. Series are downsampled to at most 600 points per signal by keeping each bucket’s minimum and maximum, so short peaks such as DC fast-charge power survive. Exports are generated in the browser from data already loaded; nothing is uploaded. The page is served with a per-response Content-Security-Policy nonce, so only its own script can run.
+Chart ranges end at the newest telemetry record rather than the current time, so a sleeping car still shows its last day of data. Series are downsampled to at most 600 points per signal by keeping each bucket’s minimum and maximum, so short peaks such as DC fast-charge power survive. Parsed telemetry is cached in memory and reused until a telemetry file’s size, modification time, or inode changes (an append, a rewrite, or `telemetry.sh sync`), so switching chart ranges and repeat refreshes skip re-reading the file; the dashboard, cluster, and MCP tools share this cache. Exports are generated in the browser from data already loaded; nothing is uploaded. The page is served with a per-response Content-Security-Policy nonce, so only its own script can run.
 
 On Windows, use `run-dashboard.cmd`. On macOS or Linux, use `run-dashboard.sh`. The dashboard requires Node.js and the same local private environment file as the stdio MCP. Keep the bind address at `127.0.0.1`; do not expose the dashboard to a network or the public internet.
 
@@ -241,7 +241,7 @@ pnpm smoke:http
 pnpm test
 ```
 
-The first check starts the stdio server, runs MCP tool discovery, and verifies that all documented tools are registered. The second validates the token-protected Streamable HTTP MCP companion. `pnpm test` builds and runs the analytics, SOH, CAN, cluster, and dashboard checks against fixtures. None of these call Tesla or require vehicle credentials.
+The first check starts the stdio server, runs MCP tool discovery, and verifies that all documented tools are registered. The second validates the token-protected Streamable HTTP MCP companion. `pnpm test` builds and runs the analytics, SOH, CAN, cluster, dashboard, and telemetry-cache checks against fixtures. None of these call Tesla or require vehicle credentials.
 
 ## Privacy and safety boundaries
 

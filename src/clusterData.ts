@@ -1,5 +1,3 @@
-import { stat } from "node:fs/promises";
-import { homedir } from "node:os";
 import { readTelemetry } from "./telemetry.js";
 import type { JsonPrimitive, TelemetryPoint } from "./types.js";
 
@@ -56,14 +54,10 @@ export function buildCluster(points: TelemetryPoint[], now = Date.now()) {
     ageSeconds: lastAt === undefined ? null : (now - lastAt) / 1000, fields: readings };
 }
 
-let cache: { key: string; points: TelemetryPoint[] } | undefined;
 export async function getClusterSnapshot() {
   const configured = process.env.TESLA_CLUSTER_TELEMETRY_FILE?.trim() || process.env.TESLA_TELEMETRY_FILE?.split(",")[0]?.trim();
   if (!configured) throw new Error("Cluster telemetry file is not configured");
-  const path = configured.replace(/^~(?=\/|$)/, homedir());
-  const info = await stat(path);
-  const key = `${path}:${info.size}:${info.mtimeMs}`;
-  // ponytail: reparse on file changes; use an incremental reader if log growth makes this slow.
-  if (cache?.key !== key) cache = { key, points: await readTelemetry(process.env.TESLA_CLUSTER_VIN?.trim() || undefined, undefined, path) };
-  return buildCluster(cache.points);
+  // readTelemetry reuses its parse until the file changes.
+  // ponytail: a growing file is fully re-parsed on each change; use an incremental reader if log growth makes this slow.
+  return buildCluster(await readTelemetry(process.env.TESLA_CLUSTER_VIN?.trim() || undefined, undefined, configured));
 }

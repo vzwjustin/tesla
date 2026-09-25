@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && node test/analytics.test.mjs && node test/can.test.mjs && node test/cluster.test.mjs && node test/soh.test.mjs && node test/dashboard.test.mjs",
+    "test": "tsc -p tsconfig.json && node test/analytics.test.mjs && node test/can.test.mjs && node test/cluster.test.mjs && node test/soh.test.mjs && node test/dashboard.test.mjs && node test/telemetry.test.mjs",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "oauth": "node dist/oauth.js",
